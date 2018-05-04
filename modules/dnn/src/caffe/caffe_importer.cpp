@@ -103,6 +103,19 @@ public:
             ReadNetParamsFromBinaryBufferOrDie(dataModel, lenModel, &netBinary);
     }
 
+    void extractCustomParams(const google::protobuf::UnknownFieldSet& unknownFields, cv::dnn::LayerParams &params)
+    {
+        const int numFields = unknownFields.field_count();
+        for (int i = 0; i < numFields; ++i)
+        {
+            const google::protobuf::UnknownField& field = unknownFields.field(i);
+            CV_Assert(field.type() == google::protobuf::UnknownField::TYPE_GROUP);
+            std::string fieldName = field.group().field(0).length_delimited();
+            std::string fieldValue = field.group().field(1).length_delimited();
+            params.set(fieldName, fieldValue);
+        }
+    }
+
     void addParam(const Message &msg, const FieldDescriptor *field, cv::dnn::LayerParams &params)
     {
         const Reflection *refl = msg.GetReflection();
@@ -187,12 +200,15 @@ public:
             if (!isInternal && !ends_with_param(fd->name()))
                 continue;
 
+            const google::protobuf::UnknownFieldSet& unknownFields = msgRefl->GetUnknownFields(msg);
             bool hasData =  fd->is_required() ||
                             (fd->is_optional() && msgRefl->HasField(msg, fd)) ||
-                            (fd->is_repeated() && msgRefl->FieldSize(msg, fd) > 0);
+                            (fd->is_repeated() && msgRefl->FieldSize(msg, fd) > 0) ||
+                            !unknownFields.empty();
             if (!hasData)
                 continue;
 
+            extractCustomParams(unknownFields, params);
             if (fd->cpp_type() == FieldDescriptor::CPPTYPE_MESSAGE)
             {
                 if (fd->is_repeated()) //Extract only first item!
@@ -258,7 +274,7 @@ public:
         }
     }
 
-    void extractBinaryLayerParms(const caffe::LayerParameter& layer, LayerParams& layerParams)
+    void extractBinaryLayerParams(const caffe::LayerParameter& layer, LayerParams& layerParams)
     {
         const std::string &name = layer.name();
 
@@ -319,7 +335,7 @@ public:
             LayerParams layerParams;
 
             extractLayerParams(layer, layerParams);
-            extractBinaryLayerParms(layer, layerParams);
+            extractBinaryLayerParams(layer, layerParams);
 
             int repetitions = layerCounter[name]++;
             if (repetitions)
@@ -334,6 +350,28 @@ public:
                     netInputs.push_back(addedBlobs.back().name);
                 }
                 continue;
+            }
+            else if (type == "BatchNorm")
+            {
+                if (!layerParams.get<bool>("use_global_stats", true))
+                {
+                    CV_Assert(layer.bottom_size() == 1, layer.top_size() == 1);
+
+                    LayerParams mvnParams;
+                    mvnParams.set("eps", layerParams.get<float>("eps", 1e-5));
+                    std::string mvnName = name + "/mvn";
+
+                    int repetitions = layerCounter[mvnName]++;
+                    if (repetitions)
+                        mvnName += String("_") + toString(repetitions);
+
+                    int mvnId = dstNet.addLayer(mvnName, "MVN", mvnParams);
+                    addInput(layer.bottom(0), mvnId, 0, dstNet);
+                    addOutput(layer, mvnId, 0);
+                    net.mutable_layer(li)->set_bottom(0, layer.top(0));
+                    layerParams.blobs[0].setTo(0);  // mean
+                    layerParams.blobs[1].setTo(1);  // std
+                }
             }
 
             int id = dstNet.addLayer(name, type, layerParams);

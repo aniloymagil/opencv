@@ -101,6 +101,8 @@ struct TorchImporter
     std::set<int> readedIndexes;
     std::map<int, Mat> storages;
     std::map<int, Mat> tensors;
+    // Stack with numbers of unconnected layers per scope (Sequential, ConcatTable etc.)
+    std::vector<int> numUnconnectedLayers;
 
     struct Module
     {
@@ -489,15 +491,7 @@ struct TorchImporter
                     layerParams.set("inputDimension", scalarParams.get<int>("inputDimension"));
                     layerParams.set("outputDimension", scalarParams.get<int>("outputDimension"));
                 }
-                if (nnName == "Concat")
-                {
-                    layerParams.set("dimension", scalarParams.get<int>("dimension"));
-                }
-                if (nnName == "JoinTable")
-                {
-                    layerParams.set("dimension", scalarParams.get<int>("dimension"));
-                }
-                if (nnName == "DepthConcat")
+                else if (nnName == "Concat" || nnName == "JoinTable" || nnName == "DepthConcat")
                 {
                     layerParams.set("dimension", scalarParams.get<int>("dimension"));
                 }
@@ -559,7 +553,11 @@ struct TorchImporter
                     layerParams.set("indices_blob_id", tensorParams["indices"].first);
                 }
                 if (nnName == "SpatialAveragePooling")
+                {
                     layerParams.set("pool", "AVE");
+                    layerParams.set("ave_pool_padded_area", scalarParams.has("count_include_pad") &&
+                                                            scalarParams.get<bool>("count_include_pad"));
+                }
                 convertTorchKernelsParams(scalarParams, layerParams);
 
                 CV_Assert(scalarParams.has("ceil_mode"));
@@ -942,7 +940,21 @@ struct TorchImporter
             }
             else
             {
-                CV_Error(Error::StsNotImplemented, "Unknown nn class \"" + className + "\"");
+                // Importer does not know how to map Torch's layer type to an OpenCV's one.
+                // However we parse all the parameters to let user create a custom layer.
+                readTorchTable(scalarParams, tensorParams);
+                for (std::map<String, DictValue>::const_iterator it = scalarParams.begin();
+                     it != scalarParams.end(); ++it)
+                {
+                    layerParams.set(it->first, it->second);
+                }
+                for (std::map<String, std::pair<int, Mat> >::iterator it = tensorParams.begin();
+                     it != tensorParams.end(); ++it)
+                {
+                    layerParams.blobs.push_back(it->second.second);
+                }
+                newModule->apiType = nnName;
+                curModule->modules.push_back(newModule);
             }
         }
         else
@@ -1092,6 +1104,7 @@ struct TorchImporter
                 {
                     newId = fill(module->modules[i], addedModules, prevLayerId, prevOutNum);
                 }
+                numUnconnectedLayers.push_back(module->modules.size());
                 return newId;
             }
             else if (module->thName == "JoinTable") {
@@ -1104,9 +1117,14 @@ struct TorchImporter
                 mergeId = net.addLayer(generateLayerName("torchMerge"), "Concat", mergeParams);
                 addedModules.push_back(std::make_pair(mergeId, module));
 
-                for (int i = 0; i < ids.size(); i++)
+                // Connect to the last number of unconnected layers.
+                CV_Assert(!numUnconnectedLayers.empty());
+                const int numInputs = numUnconnectedLayers.back();
+                numUnconnectedLayers.pop_back();
+                CV_Assert(numInputs <= ids.size());
+                for (int i = 0; i < numInputs; i++)
                 {
-                    net.connect(ids[i], 0, mergeId, i);
+                    net.connect(ids[ids.size() - numInputs + i], 0, mergeId, i);
                 }
 
                 return mergeId;
@@ -1120,9 +1138,14 @@ struct TorchImporter
 
                 int id = net.addLayer(name, "Eltwise", params);
 
-                for (int i = 0; i < ids.size(); i++)
+                // Connect to the last number of unconnected layers.
+                CV_Assert(!numUnconnectedLayers.empty());
+                const int numInputs = numUnconnectedLayers.back();
+                numUnconnectedLayers.pop_back();
+                CV_Assert(numInputs <= ids.size());
+                for (int i = 0; i < numInputs; i++)
                 {
-                    net.connect(ids[i], 0, id, i);
+                    net.connect(ids[ids.size() - numInputs + i], 0, id, i);
                 }
 
                 addedModules.push_back(std::make_pair(id, module));

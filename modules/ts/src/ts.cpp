@@ -77,6 +77,10 @@
 
 #include "opencv_tests_config.hpp"
 
+namespace opencv_test {
+bool required_opencv_test_namespace = false;  // compilation check for non-refactored tests
+}
+
 namespace cvtest
 {
 
@@ -832,7 +836,7 @@ std::string findDataFile(const std::string& relative_path, bool required)
 #endif
 #endif
     if (required)
-        CV_ErrorNoReturn(cv::Error::StsError, cv::format("OpenCV tests: Can't find required data file: %s", relative_path.c_str()));
+        CV_Error(cv::Error::StsError, cv::format("OpenCV tests: Can't find required data file: %s", relative_path.c_str()));
     throw SkipTestException(cv::format("OpenCV tests: Can't find data file: %s", relative_path.c_str()));
 }
 

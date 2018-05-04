@@ -295,6 +295,15 @@ enum InterpolationFlags{
     WARP_INVERSE_MAP     = 16
 };
 
+/** \brief Specify the polar mapping mode
+@sa warpPolar
+*/
+enum WarpPolarMode
+{
+    WARP_POLAR_LINEAR = 0, ///< Remaps an image to/from polar space.
+    WARP_POLAR_LOG = 256   ///< Remaps an image to/from semilog-polar space.
+};
+
 enum InterpolationMasks {
        INTER_BITS      = 5,
        INTER_BITS2     = INTER_BITS * 2,
@@ -377,7 +386,9 @@ enum GrabCutModes {
     automatically initialized with GC_BGD .*/
     GC_INIT_WITH_MASK  = 1,
     /** The value means that the algorithm should just resume. */
-    GC_EVAL            = 2
+    GC_EVAL            = 2,
+    /** The value means that the algorithm should just run the grabCut algorithm (a single iteration) with the fixed model */
+    GC_EVAL_FREEZE_MODEL = 3
 };
 
 //! distanceTransform algorithm flags
@@ -2072,6 +2083,27 @@ CV_EXPORTS_W void HoughLinesP( InputArray image, OutputArray lines,
                                double rho, double theta, int threshold,
                                double minLineLength = 0, double maxLineGap = 0 );
 
+/** @brief Finds lines in a set of points using the standard Hough transform.
+
+The function finds lines in a set of points using a modification of the Hough transform.
+@include snippets/imgproc_HoughLinesPointSet.cpp
+@param _point Input vector of points. Each vector must be encoded as a Point vector \f$(x,y)\f$. Type must be CV_32FC2 or CV_32SC2.
+@param _lines Output vector of found lines. Each vector is encoded as a vector<Vec3d> \f$(votes, rho, theta)\f$.
+The larger the value of 'votes', the higher the reliability of the Hough line.
+@param lines_max Max count of hough lines.
+@param threshold Accumulator threshold parameter. Only those lines are returned that get enough
+votes ( \f$>\texttt{threshold}\f$ )
+@param min_rho Minimum Distance value of the accumulator in pixels.
+@param max_rho Maximum Distance value of the accumulator in pixels.
+@param rho_step Distance resolution of the accumulator in pixels.
+@param min_theta Minimum angle value of the accumulator in radians.
+@param max_theta Maximum angle value of the accumulator in radians.
+@param theta_step Angle resolution of the accumulator in radians.
+ */
+CV_EXPORTS_W void HoughLinesPointSet( InputArray _point, OutputArray _lines, int lines_max, int threshold,
+                                      double min_rho, double max_rho, double rho_step,
+                                      double min_theta, double max_theta, double theta_step );
+
 /** @example houghcircles.cpp
 An example using the Hough circle detector
 */
@@ -2525,7 +2557,10 @@ An example using the cv::linearPolar and cv::logPolar operations
 
 /** @brief Remaps an image to semilog-polar coordinates space.
 
-Transform the source image using the following transformation (See @ref polar_remaps_reference_image "Polar remaps reference image"):
+@deprecated This function produces same result as cv::warpPolar(src, dst, src.size(), center, maxRadius, flags+WARP_POLAR_LOG);
+
+@internal
+Transform the source image using the following transformation (See @ref polar_remaps_reference_image "Polar remaps reference image d)"):
 \f[\begin{array}{l}
   dst( \rho , \phi ) = src(x,y) \\
   dst.size() \leftarrow src.size()
@@ -2535,13 +2570,13 @@ where
 \f[\begin{array}{l}
   I = (dx,dy) = (x - center.x,y - center.y) \\
   \rho = M \cdot log_e(\texttt{magnitude} (I)) ,\\
-  \phi = Ky \cdot \texttt{angle} (I)_{0..360 deg} \\
+  \phi = Kangle \cdot \texttt{angle} (I) \\
 \end{array}\f]
 
 and
 \f[\begin{array}{l}
   M = src.cols / log_e(maxRadius) \\
-  Ky = src.rows / 360 \\
+  Kangle = src.rows / 2\Pi \\
 \end{array}\f]
 
 The function emulates the human "foveal" vision and can be used for fast scale and
@@ -2555,16 +2590,19 @@ rotation-invariant template matching, for object tracking and so forth.
 @note
 -   The function can not operate in-place.
 -   To calculate magnitude and angle in degrees #cartToPolar is used internally thus angles are measured from 0 to 360 with accuracy about 0.3 degrees.
+
+@sa cv::linearPolar
+@endinternal
 */
 CV_EXPORTS_W void logPolar( InputArray src, OutputArray dst,
                             Point2f center, double M, int flags );
 
 /** @brief Remaps an image to polar coordinates space.
 
-@anchor polar_remaps_reference_image
-![Polar remaps reference](pics/polar_remap_doc.png)
+@deprecated This function produces same result as cv::warpPolar(src, dst, src.size(), center, maxRadius, flags)
 
-Transform the source image using the following transformation:
+@internal
+Transform the source image using the following transformation (See @ref polar_remaps_reference_image "Polar remaps reference image c)"):
 \f[\begin{array}{l}
   dst( \rho , \phi ) = src(x,y) \\
   dst.size() \leftarrow src.size()
@@ -2573,14 +2611,14 @@ Transform the source image using the following transformation:
 where
 \f[\begin{array}{l}
   I = (dx,dy) = (x - center.x,y - center.y) \\
-  \rho = Kx \cdot \texttt{magnitude} (I) ,\\
-  \phi = Ky \cdot \texttt{angle} (I)_{0..360 deg}
+  \rho = Kmag \cdot \texttt{magnitude} (I) ,\\
+  \phi = angle \cdot \texttt{angle} (I)
 \end{array}\f]
 
 and
 \f[\begin{array}{l}
   Kx = src.cols / maxRadius \\
-  Ky = src.rows / 360
+  Ky = src.rows / 2\Pi
 \end{array}\f]
 
 
@@ -2594,9 +2632,103 @@ and
 -   The function can not operate in-place.
 -   To calculate magnitude and angle in degrees #cartToPolar is used internally thus angles are measured from 0 to 360 with accuracy about 0.3 degrees.
 
+@sa cv::logPolar
+@endinternal
 */
 CV_EXPORTS_W void linearPolar( InputArray src, OutputArray dst,
                                Point2f center, double maxRadius, int flags );
+
+
+/** \brief Remaps an image to polar or semilog-polar coordinates space
+
+@anchor polar_remaps_reference_image
+![Polar remaps reference](pics/polar_remap_doc.png)
+
+Transform the source image using the following transformation:
+\f[
+dst(\rho , \phi ) = src(x,y)
+\f]
+
+where
+\f[
+\begin{array}{l}
+\vec{I} = (x - center.x, \;y - center.y) \\
+\phi = Kangle \cdot \texttt{angle} (\vec{I}) \\
+\rho = \left\{\begin{matrix}
+Klin \cdot \texttt{magnitude} (\vec{I}) & default \\
+Klog \cdot log_e(\texttt{magnitude} (\vec{I})) & if \; semilog \\
+\end{matrix}\right.
+\end{array}
+\f]
+
+and
+\f[
+\begin{array}{l}
+Kangle = dsize.height / 2\Pi \\
+Klin = dsize.width / maxRadius \\
+Klog = dsize.width / log_e(maxRadius) \\
+\end{array}
+\f]
+
+
+\par Linear vs semilog mapping
+
+Polar mapping can be linear or semi-log. Add one of #WarpPolarMode to `flags` to specify the polar mapping mode.
+
+Linear is the default mode.
+
+The semilog mapping emulates the human "foveal" vision that permit very high acuity on the line of sight (central vision)
+in contrast to peripheral vision where acuity is minor.
+
+\par Option on `dsize`:
+
+- if both values in `dsize <=0 ` (default),
+the destination image will have (almost) same area of source bounding circle:
+\f[\begin{array}{l}
+dsize.area  \leftarrow (maxRadius^2 \cdot \Pi) \\
+dsize.width = \texttt{cvRound}(maxRadius) \\
+dsize.height = \texttt{cvRound}(maxRadius \cdot \Pi) \\
+\end{array}\f]
+
+
+- if only `dsize.height <= 0`,
+the destination image area will be proportional to the bounding circle area but scaled by `Kx * Kx`:
+\f[\begin{array}{l}
+dsize.height = \texttt{cvRound}(dsize.width \cdot \Pi) \\
+\end{array}
+\f]
+
+- if both values in `dsize > 0 `,
+the destination image will have the given size therefore the area of the bounding circle will be scaled to `dsize`.
+
+
+\par Reverse mapping
+
+You can get reverse mapping adding #WARP_INVERSE_MAP to `flags`
+\snippet polar_transforms.cpp InverseMap
+
+In addiction, to calculate the original coordinate from a polar mapped coordinate \f$(rho, phi)->(x, y)\f$:
+\snippet polar_transforms.cpp InverseCoordinate
+
+@param src Source image.
+@param dst Destination image. It will have same type as src.
+@param dsize The destination image size (see description for valid options).
+@param center The transformation center.
+@param maxRadius The radius of the bounding circle to transform. It determines the inverse magnitude scale parameter too.
+@param flags A combination of interpolation methods, #InterpolationFlags + #WarpPolarMode.
+            - Add #WARP_POLAR_LINEAR to select linear polar mapping (default)
+            - Add #WARP_POLAR_LOG to select semilog polar mapping
+            - Add #WARP_INVERSE_MAP for reverse mapping.
+@note
+-  The function can not operate in-place.
+-  To calculate magnitude and angle in degrees #cartToPolar is used internally thus angles are measured from 0 to 360 with accuracy about 0.3 degrees.
+-  This function uses #remap. Due to current implementation limitations the size of an input and output images should be less than 32767x32767.
+
+@sa cv::remap
+*/
+CV_EXPORTS_W void warpPolar(InputArray src, OutputArray dst, Size dsize,
+                            Point2f center, double maxRadius, int flags);
+
 
 //! @} imgproc_transform
 
@@ -3673,6 +3805,8 @@ channels is derived automatically from src and code.
  */
 CV_EXPORTS_W void cvtColor( InputArray src, OutputArray dst, int code, int dstCn = 0 );
 
+CV_EXPORTS_W void cvtColorTwoPlane( InputArray src1, InputArray src2, OutputArray dst, int code );
+
 //! @} imgproc_misc
 
 // main function for all demosaicing processes
@@ -4316,6 +4450,10 @@ CV_EXPORTS_W void applyColorMap(InputArray src, OutputArray dst, InputArray user
 //! @addtogroup imgproc_draw
 //! @{
 
+
+/** OpenCV color channel order is BGR[A] */
+#define CV_RGB(r, g, b)  cv::Scalar((b), (g), (r), 0)
+
 /** @brief Draws a line segment connecting two points.
 
 The function line draws the line segment between pt1 and pt2 points in the image. The line is
@@ -4373,7 +4511,7 @@ CV_EXPORTS_W void rectangle(InputOutputArray img, Point pt1, Point pt2,
 use `rec` parameter as alternative specification of the drawn rectangle: `r.tl() and
 r.br()-Point(1,1)` are opposite corners
 */
-CV_EXPORTS void rectangle(CV_IN_OUT Mat& img, Rect rec,
+CV_EXPORTS_W void rectangle(InputOutputArray img, Rect rec,
                           const Scalar& color, int thickness = 1,
                           int lineType = LINE_8, int shift = 0);
 
@@ -4467,7 +4605,7 @@ marker types are supported, see #MarkerTypes for more information.
 @param line_type Type of the line, See #LineTypes
 @param markerSize The length of the marker axis [default = 20 pixels]
  */
-CV_EXPORTS_W void drawMarker(CV_IN_OUT Mat& img, Point position, const Scalar& color,
+CV_EXPORTS_W void drawMarker(InputOutputArray img, Point position, const Scalar& color,
                              int markerType = MARKER_CROSS, int markerSize=20, int thickness=1,
                              int line_type=8);
 
@@ -4804,7 +4942,7 @@ for(int i = 0; i < it2.count; i++, ++it2)
 class CV_EXPORTS LineIterator
 {
 public:
-    /** @brief intializes the iterator
+    /** @brief initializes the iterator
 
     creates iterators for the line connecting pt1 and pt2
     the line will be clipped on the image boundaries
@@ -4879,9 +5017,5 @@ Point LineIterator::pos() const
 //! @} imgproc
 
 } // cv
-
-#ifndef DISABLE_OPENCV_24_COMPATIBILITY
-#include "opencv2/imgproc/imgproc_c.h"
-#endif
 
 #endif

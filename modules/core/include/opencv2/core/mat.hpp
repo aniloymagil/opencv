@@ -53,9 +53,7 @@
 
 #include "opencv2/core/bufferpool.hpp"
 
-#ifdef CV_CXX11
 #include <type_traits>
-#endif
 
 namespace cv
 {
@@ -198,10 +196,8 @@ public:
     _InputArray(const UMat& um);
     _InputArray(const std::vector<UMat>& umv);
 
-#ifdef CV_CXX_STD_ARRAY
     template<typename _Tp, std::size_t _Nm> _InputArray(const std::array<_Tp, _Nm>& arr);
     template<std::size_t _Nm> _InputArray(const std::array<Mat, _Nm>& arr);
-#endif
 
     Mat getMat(int idx=-1) const;
     Mat getMat_(int idx=-1) const;
@@ -240,6 +236,7 @@ public:
     bool isUMatVector() const;
     bool isMatx() const;
     bool isVector() const;
+    bool isGpuMat() const;
     bool isGpuMatVector() const;
     ~_InputArray();
 
@@ -548,10 +545,11 @@ struct CV_EXPORTS UMatData
 struct CV_EXPORTS MatSize
 {
     explicit MatSize(int* _p);
+    int dims() const;
     Size operator()() const;
     const int& operator[](int i) const;
     int& operator[](int i);
-    operator const int*() const;
+    operator const int*() const;  // TODO OpenCV 4.0: drop this
     bool operator == (const MatSize& sz) const;
     bool operator != (const MatSize& sz) const;
 
@@ -984,12 +982,14 @@ public:
     */
     template<typename _Tp> explicit Mat(const std::vector<_Tp>& vec, bool copyData=false);
 
-#ifdef CV_CXX11
     /** @overload
     */
     template<typename _Tp, typename = typename std::enable_if<std::is_arithmetic<_Tp>::value>::type>
     explicit Mat(const std::initializer_list<_Tp> list);
-#endif
+
+    /** @overload
+    */
+    template<typename _Tp> explicit Mat(const std::initializer_list<int> sizes, const std::initializer_list<_Tp> list);
 
 #ifdef CV_CXX_STD_ARRAY
     /** @overload
@@ -2052,10 +2052,8 @@ public:
     /** @overload */
     template<typename _Tp, typename Functor> void forEach(const Functor& operation) const;
 
-#ifdef CV_CXX_MOVE_SEMANTICS
     Mat(Mat&& m);
     Mat& operator = (Mat&& m);
-#endif
 
     enum { MAGIC_VAL  = 0x42FF0000, AUTO_STEP = 0, CONTINUOUS_FLAG = CV_MAT_CONT_FLAG, SUBMATRIX_FLAG = CV_SUBMAT_FLAG };
     enum { MAGIC_MASK = 0xFFFF0000, TYPE_MASK = 0x00000FFF, DEPTH_MASK = 7 };
@@ -2180,7 +2178,7 @@ public:
     Mat_(int _ndims, const int* _sizes);
     //! n-dim array constructor that sets each matrix element to specified value
     Mat_(int _ndims, const int* _sizes, const _Tp& value);
-    //! copy/conversion contructor. If m is of different type, it's converted
+    //! copy/conversion constructor. If m is of different type, it's converted
     Mat_(const Mat& m);
     //! copy constructor
     Mat_(const Mat_& m);
@@ -2206,9 +2204,8 @@ public:
     explicit Mat_(const Point3_<typename DataType<_Tp>::channel_type>& pt, bool copyData=true);
     explicit Mat_(const MatCommaInitializer_<_Tp>& commaInitializer);
 
-#ifdef CV_CXX11
     Mat_(std::initializer_list<_Tp> values);
-#endif
+    explicit Mat_(const std::initializer_list<int> sizes, const std::initializer_list<_Tp> values);
 
 #ifdef CV_CXX_STD_ARRAY
     template <std::size_t _Nm> explicit Mat_(const std::array<_Tp, _Nm>& arr, bool copyData=false);
@@ -2270,7 +2267,7 @@ public:
     static MatExpr eye(int rows, int cols);
     static MatExpr eye(Size size);
 
-    //! some more overriden methods
+    //! some more overridden methods
     Mat_& adjustROI( int dtop, int dbottom, int dleft, int dright );
     Mat_ operator()( const Range& rowRange, const Range& colRange ) const;
     Mat_ operator()( const Rect& roi ) const;
@@ -2320,7 +2317,6 @@ public:
     //! conversion to Matx
     template<int m, int n> operator Matx<typename DataType<_Tp>::channel_type, m, n>() const;
 
-#ifdef CV_CXX_MOVE_SEMANTICS
     Mat_(Mat_&& m);
     Mat_& operator = (Mat_&& m);
 
@@ -2328,7 +2324,6 @@ public:
     Mat_& operator = (Mat&& m);
 
     Mat_(MatExpr&& e);
-#endif
 };
 
 typedef Mat_<uchar> Mat1b;
@@ -2525,10 +2520,8 @@ public:
     //! returns N if the matrix is 1-channel (N x ptdim) or ptdim-channel (1 x N) or (N x 1); negative number otherwise
     int checkVector(int elemChannels, int depth=-1, bool requireContinuous=true) const;
 
-#ifdef CV_CXX_MOVE_SEMANTICS
     UMat(UMat&& m);
     UMat& operator = (UMat&& m);
-#endif
 
     /*! Returns the OpenCL buffer handle on which UMat operates on.
         The UMat instance should be kept alive during the use of the handle to prevent the buffer to be
@@ -2938,7 +2931,7 @@ public:
 
     //! the default constructor
     SparseMat_();
-    //! the full constructor equivelent to SparseMat(dims, _sizes, DataType<_Tp>::type)
+    //! the full constructor equivalent to SparseMat(dims, _sizes, DataType<_Tp>::type)
     SparseMat_(int dims, const int* _sizes);
     //! the copy constructor. If DataType<_Tp>.type != m.type(), the m elements are converted
     SparseMat_(const SparseMat& m);
