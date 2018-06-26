@@ -644,8 +644,9 @@ void TFImporter::populateNet(Net dstNet)
                 CV_Assert(layer.input_size() == 3);
 
                 DictValue dilation = parseDims(getConstBlob(layer, value_id, 1));
-                CV_Assert(dilation.size() == 2 && dilation.get<int>(0) == dilation.get<int>(1));
-                layerParams.set("dilation", dilation.get<int>(0));
+                CV_Assert(dilation.size() == 2);
+                layerParams.set("dilation_h", dilation.get<int>(0));
+                layerParams.set("dilation_w", dilation.get<int>(1));
 
                 Mat paddings;
                 parseTensor<int>(getConstBlob(layer, value_id, 2), paddings);
@@ -655,6 +656,10 @@ void TFImporter::populateNet(Net dstNet)
                 layerParams.set("pad_w", paddings.at<float>(2));
 
                 StrIntVector next_layers = getNextLayers(net, name, "Conv2D");
+                if (next_layers.empty())
+                {
+                    next_layers = getNextLayers(net, name, "DepthwiseConv2dNative");
+                }
                 CV_Assert(next_layers.size() == 1);
                 layer = net.node(next_layers[0].second);
                 layers_to_ignore.insert(next_layers[0].first);
@@ -677,7 +682,9 @@ void TFImporter::populateNet(Net dstNet)
                 layers_to_ignore.insert(next_layers[0].first);
             }
 
-            kernelFromTensor(getConstBlob(layer, value_id), layerParams.blobs[0]);
+            const tensorflow::TensorProto& kernelTensor = getConstBlob(layer, value_id);
+            kernelFromTensor(kernelTensor, layerParams.blobs[0]);
+            releaseTensor(const_cast<tensorflow::TensorProto*>(&kernelTensor));
             int* kshape = layerParams.blobs[0].size.p;
             if (type == "DepthwiseConv2dNative")
             {
@@ -741,10 +748,20 @@ void TFImporter::populateNet(Net dstNet)
 
             if (haveConst)
             {
-                layerParams.blobs.resize(1);
-                blobFromTensor(getConstBlob(layer, value_id), layerParams.blobs[0]);
+                Mat values = getTensorContent(getConstBlob(layer, value_id));
+                CV_Assert(values.type() == CV_32FC1);
 
-                int id = dstNet.addLayer(name, "Shift", layerParams);
+                int id;
+                if (values.total() == 1)  // is a scalar.
+                {
+                    layerParams.set("shift", values.at<float>(0));
+                    id = dstNet.addLayer(name, "Power", layerParams);
+                }
+                else  // is a vector
+                {
+                    layerParams.blobs.resize(1, values);
+                    id = dstNet.addLayer(name, "Shift", layerParams);
+                }
                 layer_id[name] = id;
 
                 // one input only
@@ -764,6 +781,36 @@ void TFImporter::populateNet(Net dstNet)
                     dstNet.connect(layer_id.at(inp.name), inp.blobIndex, id, ii);
                 }
             }
+        }
+        else if (type == "Sub")
+        {
+            bool haveConst = false;
+            for(int ii = 0; !haveConst && ii < layer.input_size(); ++ii)
+            {
+                Pin input = parsePin(layer.input(ii));
+                haveConst = value_id.find(input.name) != value_id.end();
+            }
+            CV_Assert(haveConst);
+
+            Mat values = getTensorContent(getConstBlob(layer, value_id));
+            CV_Assert(values.type() == CV_32FC1);
+            values *= -1.0f;
+
+            int id;
+            if (values.total() == 1)  // is a scalar.
+            {
+                layerParams.set("shift", values.at<float>(0));
+                id = dstNet.addLayer(name, "Power", layerParams);
+            }
+            else  // is a vector
+            {
+                layerParams.blobs.resize(1, values);
+                id = dstNet.addLayer(name, "Shift", layerParams);
+            }
+            layer_id[name] = id;
+
+            // one input only
+            connect(layer_id, dstNet, parsePin(layer.input(0)), id, 0);
         }
         else if (type == "MatMul")
         {
@@ -788,7 +835,9 @@ void TFImporter::populateNet(Net dstNet)
             }
 
             int kernel_blob_index = -1;
-            blobFromTensor(getConstBlob(layer, value_id, -1, &kernel_blob_index), layerParams.blobs[0]);
+            const tensorflow::TensorProto& kernelTensor = getConstBlob(layer, value_id, -1, &kernel_blob_index);
+            blobFromTensor(kernelTensor, layerParams.blobs[0]);
+            releaseTensor(const_cast<tensorflow::TensorProto*>(&kernelTensor));
 
             if (kernel_blob_index == 1) { // In this case output is computed by x*W formula - W should be transposed
                 Mat data = layerParams.blobs[0].t();
@@ -1045,9 +1094,9 @@ void TFImporter::populateNet(Net dstNet)
             CV_Assert(!begins.empty(), !sizes.empty(), begins.type() == CV_32SC1,
                       sizes.type() == CV_32SC1);
 
-            if (begins.total() == 4)
+            if (begins.total() == 4 && data_layouts[name] == DATA_LAYOUT_NHWC)
             {
-                // Perhabs, we have an NHWC order. Swap it to NCHW.
+                // Swap NHWC parameters' order to NCHW.
                 std::swap(*begins.ptr<int32_t>(0, 2), *begins.ptr<int32_t>(0, 3));
                 std::swap(*begins.ptr<int32_t>(0, 1), *begins.ptr<int32_t>(0, 2));
                 std::swap(*sizes.ptr<int32_t>(0, 2), *sizes.ptr<int32_t>(0, 3));
@@ -1126,6 +1175,9 @@ void TFImporter::populateNet(Net dstNet)
                        ExcludeLayer(net, weights_layer_index, 0, false);
                        layers_to_ignore.insert(next_layers[0].first);
                    }
+
+                    if (hasLayerAttr(layer, "axis"))
+                        layerParams.set("axis", getLayerAttr(layer, "axis").i());
 
                     id = dstNet.addLayer(name, "Scale", layerParams);
                 }
@@ -1398,18 +1450,36 @@ void TFImporter::populateNet(Net dstNet)
             connect(layer_id, dstNet, parsePin(layer.input(1)), id, 0);
             data_layouts[name] = DATA_LAYOUT_UNKNOWN;
         }
-        else if (type == "ResizeNearestNeighbor")
+        else if (type == "ResizeNearestNeighbor" || type == "ResizeBilinear")
         {
-            Mat outSize = getTensorContent(getConstBlob(layer, value_id, 1));
-            CV_Assert(outSize.type() == CV_32SC1, outSize.total() == 2);
+            if (layer.input_size() == 2)
+            {
+                Mat outSize = getTensorContent(getConstBlob(layer, value_id, 1));
+                CV_Assert(outSize.type() == CV_32SC1, outSize.total() == 2);
+                layerParams.set("height", outSize.at<int>(0, 0));
+                layerParams.set("width", outSize.at<int>(0, 1));
+            }
+            else if (layer.input_size() == 3)
+            {
+                Mat factorHeight = getTensorContent(getConstBlob(layer, value_id, 1));
+                Mat factorWidth = getTensorContent(getConstBlob(layer, value_id, 2));
+                CV_Assert(factorHeight.type() == CV_32SC1, factorHeight.total() == 1,
+                          factorWidth.type() == CV_32SC1, factorWidth.total() == 1);
+                layerParams.set("zoom_factor_x", factorWidth.at<int>(0));
+                layerParams.set("zoom_factor_y", factorHeight.at<int>(0));
+            }
+            else
+                CV_Assert(layer.input_size() == 2 || layer.input_size() == 3);
 
-            layerParams.set("height", outSize.at<int>(0, 0));
-            layerParams.set("width", outSize.at<int>(0, 1));
+            if (type == "ResizeNearestNeighbor")
+                layerParams.set("interpolation", "nearest");
+            else
+                layerParams.set("interpolation", "bilinear");
 
             if (hasLayerAttr(layer, "align_corners"))
                 layerParams.set("align_corners", getLayerAttr(layer, "align_corners").b());
 
-            int id = dstNet.addLayer(name, "ResizeNearestNeighbor", layerParams);
+            int id = dstNet.addLayer(name, "Resize", layerParams);
             layer_id[name] = id;
 
             connect(layer_id, dstNet, parsePin(layer.input(0)), id, 0);
@@ -1498,6 +1568,10 @@ void TFImporter::populateNet(Net dstNet)
                 layerParams.set("confidence_threshold", getLayerAttr(layer, "confidence_threshold").f());
             if (hasLayerAttr(layer, "loc_pred_transposed"))
                 layerParams.set("loc_pred_transposed", getLayerAttr(layer, "loc_pred_transposed").b());
+            if (hasLayerAttr(layer, "clip"))
+                layerParams.set("clip", getLayerAttr(layer, "clip").b());
+            if (hasLayerAttr(layer, "variance_encoded_in_target"))
+                layerParams.set("variance_encoded_in_target", getLayerAttr(layer, "variance_encoded_in_target").b());
 
             int id = dstNet.addLayer(name, "DetectionOutput", layerParams);
             layer_id[name] = id;
@@ -1513,6 +1587,26 @@ void TFImporter::populateNet(Net dstNet)
             int id = dstNet.addLayer(name, "Softmax", layerParams);
             layer_id[name] = id;
             connectToAllBlobs(layer_id, dstNet, parsePin(layer.input(0)), id, layer.input_size());
+        }
+        else if (type == "CropAndResize")
+        {
+            // op: "CropAndResize"
+            // input: "input"
+            // input: "boxes"
+            // input: "sizes"
+            CV_Assert(layer.input_size() == 3);
+
+            Mat cropSize = getTensorContent(getConstBlob(layer, value_id, 2));
+            CV_Assert(cropSize.type() == CV_32SC1, cropSize.total() == 2);
+
+            layerParams.set("height", cropSize.at<int>(0));
+            layerParams.set("width", cropSize.at<int>(1));
+
+            int id = dstNet.addLayer(name, "CropAndResize", layerParams);
+            layer_id[name] = id;
+
+            connect(layer_id, dstNet, parsePin(layer.input(0)), id, 0);
+            connect(layer_id, dstNet, parsePin(layer.input(1)), id, 1);
         }
         else if (type == "Mean")
         {
@@ -1546,6 +1640,27 @@ void TFImporter::populateNet(Net dstNet)
                 layer_id[flattenName] = flattenId;
                 connect(layer_id, dstNet, Pin(name), flattenId, 0);
             }
+        }
+        else if (type == "ClipByValue")
+        {
+            // op: "ClipByValue"
+            // input: "input"
+            // input: "mix"
+            // input: "max"
+            CV_Assert(layer.input_size() == 3);
+
+            Mat minValue = getTensorContent(getConstBlob(layer, value_id, 1));
+            Mat maxValue = getTensorContent(getConstBlob(layer, value_id, 2));
+            CV_Assert(minValue.total() == 1, minValue.type() == CV_32F,
+                      maxValue.total() == 1, maxValue.type() == CV_32F);
+
+            layerParams.set("min_value", minValue.at<float>(0));
+            layerParams.set("max_value", maxValue.at<float>(0));
+
+            int id = dstNet.addLayer(name, "ReLU6", layerParams);
+            layer_id[name] = id;
+
+            connect(layer_id, dstNet, parsePin(layer.input(0)), id, 0);
         }
         else if (type == "Abs" || type == "Tanh" || type == "Sigmoid" ||
                  type == "Relu" || type == "Elu" ||
