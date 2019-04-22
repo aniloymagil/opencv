@@ -52,18 +52,19 @@
 #undef WINVER
 #define WINVER _WIN32_WINNT_WIN8
 #endif
+
 #include <windows.h>
 #include <guiddef.h>
 #include <mfidl.h>
-#include <Mfapi.h>
+#include <mfapi.h>
 #include <mfplay.h>
 #include <mfobjects.h>
 #include <tchar.h>
 #include <strsafe.h>
-#include <Mfreadwrite.h>
-#ifdef HAVE_DXVA
-#include <D3D11.h>
-#include <D3d11_4.h>
+#include <mfreadwrite.h>
+#ifdef HAVE_MSMF_DXVA
+#include <d3d11.h>
+#include <d3d11_4.h>
 #endif
 #include <new>
 #include <map>
@@ -81,22 +82,42 @@
 #pragma comment(lib, "mfuuid")
 #pragma comment(lib, "Strmiids")
 #pragma comment(lib, "Mfreadwrite")
-#ifdef HAVE_DXVA
+#ifdef HAVE_MSMF_DXVA
 #pragma comment(lib, "d3d11")
+// MFCreateDXGIDeviceManager() is available since Win8 only.
+// To avoid OpenCV loading failure on Win7 use dynamic detection of this symbol.
+// Details: https://github.com/opencv/opencv/issues/11858
+typedef HRESULT (WINAPI *FN_MFCreateDXGIDeviceManager)(UINT *resetToken, IMFDXGIDeviceManager **ppDeviceManager);
+static bool pMFCreateDXGIDeviceManager_initialized = false;
+static FN_MFCreateDXGIDeviceManager pMFCreateDXGIDeviceManager = NULL;
+static void init_MFCreateDXGIDeviceManager()
+{
+    HMODULE h = LoadLibraryExA("mfplat.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (h)
+    {
+        pMFCreateDXGIDeviceManager = (FN_MFCreateDXGIDeviceManager)GetProcAddress(h, "MFCreateDXGIDeviceManager");
+    }
+    pMFCreateDXGIDeviceManager_initialized = true;
+}
 #endif
-#if (WINVER >= 0x0602) // Available since Win 8
-#pragma comment(lib, "MinCore_Downlevel")
-#endif
+#pragma comment(lib, "Shlwapi.lib")
 #endif
 
 #include <mferror.h>
 
 #include <comdef.h>
 
+#include <shlwapi.h>  // QISearch
+
 struct IMFMediaType;
 struct IMFActivate;
 struct IMFMediaSource;
 struct IMFAttributes;
+
+#define CV_CAP_MODE_BGR CV_FOURCC_MACRO('B','G','R','3')
+#define CV_CAP_MODE_RGB CV_FOURCC_MACRO('R','G','B','3')
+#define CV_CAP_MODE_GRAY CV_FOURCC_MACRO('G','R','E','Y')
+#define CV_CAP_MODE_YUYV CV_FOURCC_MACRO('Y', 'U', 'Y', 'V')
 
 namespace
 {
@@ -595,6 +616,77 @@ void MediaType::Clear()
 
 }
 
+class SourceReaderCB : public IMFSourceReaderCallback
+{
+public:
+    SourceReaderCB() :
+        m_nRefCount(0), m_hEvent(CreateEvent(NULL, FALSE, FALSE, NULL)), m_bEOS(FALSE), m_hrStatus(S_OK), m_reader(NULL), m_dwStreamIndex(0)
+    {
+    }
+
+    // IUnknown methods
+    STDMETHODIMP QueryInterface(REFIID iid, void** ppv) CV_OVERRIDE
+    {
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable:4838)
+#endif
+        static const QITAB qit[] =
+        {
+            QITABENT(SourceReaderCB, IMFSourceReaderCallback),
+            { 0 },
+        };
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+        return QISearch(this, qit, iid, ppv);
+    }
+    STDMETHODIMP_(ULONG) AddRef() CV_OVERRIDE
+    {
+        return InterlockedIncrement(&m_nRefCount);
+    }
+    STDMETHODIMP_(ULONG) Release() CV_OVERRIDE
+    {
+        ULONG uCount = InterlockedDecrement(&m_nRefCount);
+        if (uCount == 0)
+        {
+            delete this;
+        }
+        return uCount;
+    }
+
+    STDMETHODIMP OnReadSample(HRESULT hrStatus, DWORD dwStreamIndex, DWORD dwStreamFlags, LONGLONG llTimestamp, IMFSample *pSample) CV_OVERRIDE;
+    STDMETHODIMP OnEvent(DWORD, IMFMediaEvent *) CV_OVERRIDE
+    {
+        return S_OK;
+    }
+    STDMETHODIMP OnFlush(DWORD) CV_OVERRIDE
+    {
+        return S_OK;
+    }
+
+    HRESULT Wait(DWORD dwMilliseconds, _ComPtr<IMFSample>& videoSample, BOOL& pbEOS);
+
+private:
+    // Destructor is private. Caller should call Release.
+    virtual ~SourceReaderCB()
+    {
+        CV_LOG_WARNING(NULL, "terminating async callback");
+    }
+
+public:
+    long                m_nRefCount;        // Reference count.
+    cv::Mutex           m_mutex;
+    HANDLE              m_hEvent;
+    BOOL                m_bEOS;
+    HRESULT             m_hrStatus;
+
+    IMFSourceReader *m_reader;
+    DWORD m_dwStreamIndex;
+    _ComPtr<IMFSample>  m_lastSample;
+};
+
+
 /******* Capturing video from camera or file via Microsoft Media Foundation **********/
 class CvCapture_MSMF : public cv::IVideoCapture
 {
@@ -604,8 +696,6 @@ public:
         MODE_HW = 1
     } MSMFCapture_Mode;
     CvCapture_MSMF();
-    CvCapture_MSMF(int);
-    CvCapture_MSMF(const cv::String&);
     virtual ~CvCapture_MSMF();
     virtual bool open(int);
     virtual bool open(const cv::String&);
@@ -615,10 +705,10 @@ public:
     virtual bool grabFrame() CV_OVERRIDE;
     virtual bool retrieveFrame(int, cv::OutputArray) CV_OVERRIDE;
     virtual bool isOpened() const CV_OVERRIDE { return isOpen; }
-    virtual int getCaptureDomain() CV_OVERRIDE { return CV_CAP_MSMF; } // Return the type of the capture object: CV_CAP_VFW, etc...
+    virtual int getCaptureDomain() CV_OVERRIDE { return CV_CAP_MSMF; }
 protected:
     double getFramerate(MediaType MT) const;
-    bool configureOutput(UINT32 width, UINT32 height, double prefFramerate, UINT32 aspectRatioN, UINT32 aspectRatioD, int outFormat, bool convertToFormat);
+    bool configureOutput(UINT32 width, UINT32 height, double prefFramerate, UINT32 aspectRatioN, UINT32 aspectRatioD, cv::uint32_t outFormat, bool convertToFormat);
     bool setTime(double time, bool rough);
     bool configureHW(bool enable);
 
@@ -626,7 +716,7 @@ protected:
     cv::String filename;
     int camid;
     MSMFCapture_Mode captureMode;
-#ifdef HAVE_DXVA
+#ifdef HAVE_MSMF_DXVA
     _ComPtr<ID3D11Device> D3DDev;
     _ComPtr<IMFDXGIDeviceManager> D3DMgr;
 #endif
@@ -634,7 +724,7 @@ protected:
     DWORD dwStreamIndex;
     MediaType nativeFormat;
     MediaType captureFormat;
-    int outputFormat;
+    cv::uint32_t outputFormat;
     UINT32 requestedWidth, requestedHeight;
     bool convertFormat;
     UINT32 aspectN, aspectD;
@@ -643,6 +733,7 @@ protected:
     _ComPtr<IMFSample> videoSample;
     LONGLONG sampleTime;
     bool isOpen;
+    _ComPtr<IMFSourceReaderCallback> readCallback;  // non-NULL for "live" streams (camera capture)
 };
 
 CvCapture_MSMF::CvCapture_MSMF():
@@ -650,7 +741,7 @@ CvCapture_MSMF::CvCapture_MSMF():
     filename(""),
     camid(-1),
     captureMode(MODE_SW),
-#ifdef HAVE_DXVA
+#ifdef HAVE_MSMF_DXVA
     D3DDev(NULL),
     D3DMgr(NULL),
 #endif
@@ -667,8 +758,6 @@ CvCapture_MSMF::CvCapture_MSMF():
 {
     configureHW(true);
 }
-CvCapture_MSMF::CvCapture_MSMF(int index) : CvCapture_MSMF() { open(index); }
-CvCapture_MSMF::CvCapture_MSMF(const cv::String& _filename) : CvCapture_MSMF() { open(_filename); }
 
 CvCapture_MSMF::~CvCapture_MSMF()
 {
@@ -686,13 +775,18 @@ void CvCapture_MSMF::close()
         camid = -1;
         filename.clear();
     }
+    readCallback.Release();
 }
 
 bool CvCapture_MSMF::configureHW(bool enable)
 {
-#ifdef HAVE_DXVA
+#ifdef HAVE_MSMF_DXVA
     if ((enable && D3DMgr && D3DDev) || (!enable && !D3DMgr && !D3DDev))
         return true;
+    if (!pMFCreateDXGIDeviceManager_initialized)
+        init_MFCreateDXGIDeviceManager();
+    if (enable && !pMFCreateDXGIDeviceManager)
+        return false;
 
     bool reopen = isOpen;
     int prevcam = camid;
@@ -713,7 +807,7 @@ bool CvCapture_MSMF::configureHW(bool enable)
             {
                 D3DDevMT->SetMultithreadProtected(TRUE);
                 D3DDevMT.Release();
-                if (SUCCEEDED(MFCreateDXGIDeviceManager(&mgrRToken, &D3DMgr)))
+                if (SUCCEEDED(pMFCreateDXGIDeviceManager(&mgrRToken, &D3DMgr)))
                 {
                     if (SUCCEEDED(D3DMgr->ResetDevice(D3DDev.Get(), mgrRToken)))
                     {
@@ -746,7 +840,7 @@ static UINT32 resolutionDiff(MediaType& mType, UINT32 refWidth, UINT32 refHeight
 { return UDIFF(mType.width, refWidth) + UDIFF(mType.height, refHeight); }
 #undef UDIFF
 
-bool CvCapture_MSMF::configureOutput(UINT32 width, UINT32 height, double prefFramerate, UINT32 aspectRatioN, UINT32 aspectRatioD, int outFormat, bool convertToFormat)
+bool CvCapture_MSMF::configureOutput(UINT32 width, UINT32 height, double prefFramerate, UINT32 aspectRatioN, UINT32 aspectRatioD, cv::uint32_t outFormat, bool convertToFormat)
 {
     if (width != 0 && height != 0 &&
         width == captureFormat.width && height == captureFormat.height && prefFramerate == getFramerate(nativeFormat) &&
@@ -854,7 +948,8 @@ bool CvCapture_MSMF::configureOutput(UINT32 width, UINT32 height, double prefFra
 bool CvCapture_MSMF::open(int _index)
 {
     close();
-
+    if (_index < 0)
+        return false;
     _ComPtr<IMFAttributes> msAttr = NULL;
     if (SUCCEEDED(MFCreateAttributes(&msAttr, 1)) &&
         SUCCEEDED(msAttr->SetGUID(
@@ -868,7 +963,6 @@ bool CvCapture_MSMF::open(int _index)
         {
             if (count > 0)
             {
-                _index = std::min(std::max(0, _index), (int)count - 1);
                 for (int ind = 0; ind < (int)count; ind++)
                 {
                     if (ind == _index && ppDevices[ind])
@@ -883,10 +977,18 @@ bool CvCapture_MSMF::open(int _index)
                             SUCCEEDED(srAttr->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, FALSE)) &&
                             SUCCEEDED(srAttr->SetUINT32(MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, TRUE)))
                         {
-#ifdef HAVE_DXVA
+#ifdef HAVE_MSMF_DXVA
                             if (D3DMgr)
                                 srAttr->SetUnknown(MF_SOURCE_READER_D3D_MANAGER, D3DMgr.Get());
 #endif
+                            readCallback = ComPtr<IMFSourceReaderCallback>(new SourceReaderCB());
+                            HRESULT hr = srAttr->SetUnknown(MF_SOURCE_READER_ASYNC_CALLBACK, (IMFSourceReaderCallback*)readCallback.Get());
+                            if (FAILED(hr))
+                            {
+                                readCallback.Release();
+                                continue;
+                            }
+
                             if (SUCCEEDED(MFCreateSourceReaderFromMediaSource(mSrc.Get(), srAttr.Get(), &videoFileSource)))
                             {
                                 isOpen = true;
@@ -926,13 +1028,13 @@ bool CvCapture_MSMF::open(const cv::String& _filename)
         SUCCEEDED(srAttr->SetUINT32(MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, true))
         )
     {
-#ifdef HAVE_DXVA
+#ifdef HAVE_MSMF_DXVA
         if(D3DMgr)
             srAttr->SetUnknown(MF_SOURCE_READER_D3D_MANAGER, D3DMgr.Get());
 #endif
         cv::AutoBuffer<wchar_t> unicodeFileName(_filename.length() + 1);
-        MultiByteToWideChar(CP_ACP, 0, _filename.c_str(), -1, unicodeFileName, (int)_filename.length() + 1);
-        if (SUCCEEDED(MFCreateSourceReaderFromURL(unicodeFileName, srAttr.Get(), &videoFileSource)))
+        MultiByteToWideChar(CP_ACP, 0, _filename.c_str(), -1, unicodeFileName.data(), (int)_filename.length() + 1);
+        if (SUCCEEDED(MFCreateSourceReaderFromURL(unicodeFileName.data(), srAttr.Get(), &videoFileSource)))
         {
             isOpen = true;
             sampleTime = 0;
@@ -958,10 +1060,113 @@ bool CvCapture_MSMF::open(const cv::String& _filename)
     return isOpen;
 }
 
+
+HRESULT SourceReaderCB::Wait(DWORD dwMilliseconds, _ComPtr<IMFSample>& videoSample, BOOL& bEOS)
+{
+    bEOS = FALSE;
+
+    DWORD dwResult = WaitForSingleObject(m_hEvent, dwMilliseconds);
+    if (dwResult == WAIT_TIMEOUT)
+    {
+        return E_PENDING;
+    }
+    else if (dwResult != WAIT_OBJECT_0)
+    {
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+
+    bEOS = m_bEOS;
+    if (!bEOS)
+    {
+        cv::AutoLock lock(m_mutex);
+        videoSample = m_lastSample;
+        CV_Assert(videoSample);
+        m_lastSample.Release();
+        ResetEvent(m_hEvent);  // event is auto-reset, but we need this forced reset due time gap between wait() and mutex hold.
+    }
+
+    return m_hrStatus;
+}
+
+STDMETHODIMP SourceReaderCB::OnReadSample(HRESULT hrStatus, DWORD dwStreamIndex, DWORD dwStreamFlags, LONGLONG llTimestamp, IMFSample *pSample)
+{
+    CV_UNUSED(llTimestamp);
+
+    HRESULT hr = 0;
+    cv::AutoLock lock(m_mutex);
+
+    if (SUCCEEDED(hrStatus))
+    {
+        if (pSample)
+        {
+            CV_LOG_DEBUG(NULL, "videoio(MSMF): got frame at " << llTimestamp);
+            IMFSample* prev = m_lastSample.Get();
+            if (prev)
+            {
+                CV_LOG_DEBUG(NULL, "videoio(MSMF): drop frame (not processed)");
+            }
+            m_lastSample = pSample;
+        }
+    }
+    else
+    {
+        CV_LOG_WARNING(NULL, "videoio(MSMF): OnReadSample() is called with error status: " << hrStatus);
+    }
+
+    if (MF_SOURCE_READERF_ENDOFSTREAM & dwStreamFlags)
+    {
+        // Reached the end of the stream.
+        m_bEOS = true;
+    }
+    m_hrStatus = hrStatus;
+
+    if (FAILED(hr = m_reader->ReadSample(dwStreamIndex, 0, NULL, NULL, NULL, NULL)))
+    {
+        CV_LOG_WARNING(NULL, "videoio(MSMF): async ReadSample() call is failed with error status: " << hr);
+        m_bEOS = true;
+    }
+
+    if (pSample || m_bEOS)
+    {
+        SetEvent(m_hEvent);
+    }
+    return S_OK;
+}
+
+
 bool CvCapture_MSMF::grabFrame()
 {
     CV_TRACE_FUNCTION();
-    if (isOpen)
+    if (readCallback)  // async "live" capture mode
+    {
+        HRESULT hr = 0;
+        SourceReaderCB* reader = ((SourceReaderCB*)readCallback.Get());
+        if (!reader->m_reader)
+        {
+            // Initiate capturing with async callback
+            reader->m_reader = videoFileSource.Get();
+            reader->m_dwStreamIndex = dwStreamIndex;
+            if (FAILED(hr = videoFileSource->ReadSample(dwStreamIndex, 0, NULL, NULL, NULL, NULL)))
+            {
+                CV_LOG_ERROR(NULL, "videoio(MSMF): can't grab frame - initial async ReadSample() call failed: " << hr);
+                reader->m_reader = NULL;
+                return false;
+            }
+        }
+        BOOL bEOS = false;
+        if (FAILED(hr = reader->Wait(10000, videoSample, bEOS)))  // 10 sec
+        {
+            CV_LOG_WARNING(NULL, "videoio(MSMF): can't grab frame. Error: " << hr);
+            return false;
+        }
+        if (bEOS)
+        {
+            CV_LOG_WARNING(NULL, "videoio(MSMF): EOS signal. Capture stream is lost");
+            return false;
+        }
+        return true;
+    }
+    else if (isOpen)
     {
         DWORD streamIndex, flags;
         videoSample.Release();
@@ -1174,8 +1379,6 @@ double CvCapture_MSMF::getProperty( int property_id ) const
     if (isOpen)
         switch (property_id)
         {
-        case CV_CAP_PROP_FORMAT:
-                return outputFormat;
         case CV_CAP_PROP_MODE:
                 return captureMode;
         case CV_CAP_PROP_CONVERT_RGB:
@@ -1486,7 +1689,7 @@ bool CvCapture_MSMF::setProperty( int property_id, double value )
             default:
                 return false;
             }
-        case CV_CAP_PROP_FORMAT:
+        case CV_CAP_PROP_FOURCC:
             return configureOutput(requestedWidth, requestedHeight, getFramerate(nativeFormat), aspectN, aspectD, (int)cvRound(value), convertFormat);
         case CV_CAP_PROP_CONVERT_RGB:
             return configureOutput(requestedWidth, requestedHeight, getFramerate(nativeFormat), aspectN, aspectD, outputFormat, value != 0);
@@ -1510,8 +1713,6 @@ bool CvCapture_MSMF::setProperty( int property_id, double value )
             if (value >= 0)
                 return configureOutput(requestedWidth, requestedHeight, value, aspectN, aspectD, outputFormat, convertFormat);
             break;
-        case CV_CAP_PROP_FOURCC:
-            break;
         case CV_CAP_PROP_FRAME_COUNT:
             break;
         case CV_CAP_PROP_POS_AVI_RATIO:
@@ -1519,7 +1720,7 @@ bool CvCapture_MSMF::setProperty( int property_id, double value )
                 return setTime(duration * value, true);
             break;
         case CV_CAP_PROP_POS_FRAMES:
-            if (getFramerate(nativeFormat) != 0)
+            if (std::fabs(getFramerate(nativeFormat)) > 0)
                 return setTime(value  * 1e7 / getFramerate(nativeFormat), false);
             break;
         case CV_CAP_PROP_POS_MSEC:
@@ -1712,17 +1913,25 @@ bool CvCapture_MSMF::setProperty( int property_id, double value )
 
 cv::Ptr<cv::IVideoCapture> cv::cvCreateCapture_MSMF( int index )
 {
-    cv::Ptr<CvCapture_MSMF> capture = cv::makePtr<CvCapture_MSMF>(index);
-    if (capture && capture->isOpened())
-        return capture;
+    cv::Ptr<CvCapture_MSMF> capture = cv::makePtr<CvCapture_MSMF>();
+    if (capture)
+    {
+        capture->open(index);
+        if (capture->isOpened())
+            return capture;
+    }
     return cv::Ptr<cv::IVideoCapture>();
 }
 
 cv::Ptr<cv::IVideoCapture> cv::cvCreateCapture_MSMF (const cv::String& filename)
 {
-    cv::Ptr<CvCapture_MSMF> capture = cv::makePtr<CvCapture_MSMF>(filename);
-    if (capture && capture->isOpened())
-        return capture;
+    cv::Ptr<CvCapture_MSMF> capture = cv::makePtr<CvCapture_MSMF>();
+    if (capture)
+    {
+        capture->open(filename);
+        if (capture->isOpened())
+            return capture;
+    }
     return cv::Ptr<cv::IVideoCapture>();
 }
 
@@ -1736,8 +1945,6 @@ class CvVideoWriter_MSMF : public cv::IVideoWriter
 {
 public:
     CvVideoWriter_MSMF();
-    CvVideoWriter_MSMF(const cv::String& filename, int fourcc,
-                       double fps, cv::Size frameSize, bool isColor);
     virtual ~CvVideoWriter_MSMF();
     virtual bool open(const cv::String& filename, int fourcc,
                       double fps, cv::Size frameSize, bool isColor);
@@ -1748,6 +1955,7 @@ public:
     virtual bool setProperty(int, double) { return false; }
     virtual bool isOpened() const { return initiated; }
 
+    int getCaptureDomain() const CV_OVERRIDE { return cv::CAP_MSMF; }
 private:
     Media_Foundation& MF;
     UINT32 videoWidth;
@@ -1771,10 +1979,19 @@ private:
 
 CvVideoWriter_MSMF::CvVideoWriter_MSMF():
     MF(Media_Foundation::getInstance()),
-    initiated(false)
+    videoWidth(0),
+    videoHeight(0),
+    fps(0),
+    bitRate(0),
+    frameSize(0),
+    encodingFormat(),
+    inputFormat(),
+    streamIndex(0),
+    initiated(false),
+    rtStart(0),
+    rtDuration(0)
 {
 }
-CvVideoWriter_MSMF::CvVideoWriter_MSMF(const cv::String& filename, int fourcc, double fps, cv::Size frameSize, bool isColor) : CvVideoWriter_MSMF() { open(filename, fourcc, fps, frameSize, isColor); }
 
 CvVideoWriter_MSMF::~CvVideoWriter_MSMF()
 {
@@ -1875,8 +2092,8 @@ bool CvVideoWriter_MSMF::open( const cv::String& filename, int fourcc,
     {
         // Create the sink writer
         cv::AutoBuffer<wchar_t> unicodeFileName(filename.length() + 1);
-        MultiByteToWideChar(CP_ACP, 0, filename.c_str(), -1, unicodeFileName, (int)filename.length() + 1);
-        HRESULT hr = MFCreateSinkWriterFromURL(unicodeFileName, NULL, spAttr.Get(), &sinkWriter);
+        MultiByteToWideChar(CP_ACP, 0, filename.c_str(), -1, unicodeFileName.data(), (int)filename.length() + 1);
+        HRESULT hr = MFCreateSinkWriterFromURL(unicodeFileName.data(), NULL, spAttr.Get(), &sinkWriter);
         if (SUCCEEDED(hr))
         {
             // Configure the sink writer and tell it start to start accepting data
@@ -1942,12 +2159,16 @@ void CvVideoWriter_MSMF::write(cv::InputArray img)
     }
 }
 
-cv::Ptr<cv::IVideoWriter> cv::cvCreateVideoWriter_MSMF( const cv::String& filename, int fourcc,
-                                                        double fps, cv::Size frameSize, int isColor )
+cv::Ptr<cv::IVideoWriter> cv::cvCreateVideoWriter_MSMF( const std::string& filename, int fourcc,
+                                                        double fps, const cv::Size &frameSize, bool isColor )
 {
-    cv::Ptr<CvVideoWriter_MSMF> writer = cv::makePtr<CvVideoWriter_MSMF>(filename, fourcc, fps, frameSize, isColor != 0);
-    if (writer && writer->isOpened())
-        return writer;
+    cv::Ptr<CvVideoWriter_MSMF> writer = cv::makePtr<CvVideoWriter_MSMF>();
+    if (writer)
+    {
+        writer->open(filename, fourcc, fps, frameSize, isColor);
+        if (writer->isOpened())
+            return writer;
+    }
     return cv::Ptr<cv::IVideoWriter>();
 }
 

@@ -1,5 +1,7 @@
 #include "precomp.hpp"
 
+#include "ts_tags.hpp"
+
 #include <map>
 #include <iostream>
 #include <fstream>
@@ -232,7 +234,7 @@ void Regression::init(const std::string& testSuitName, const std::string& ext)
             storageOutPath += ext;
         }
     }
-    catch(cv::Exception&)
+    catch(const cv::Exception&)
     {
         LOGE("Failed to open sanity data for reading: %s", storageInPath.c_str());
     }
@@ -594,11 +596,11 @@ Regression& Regression::operator() (const std::string& name, cv::InputArray arra
     // exit if current test is already failed
     if(::testing::UnitTest::GetInstance()->current_test_info()->result()->Failed()) return *this;
 
-    if(!array.empty() && array.depth() == CV_USRTYPE1)
+    /*if(!array.empty() && array.depth() == CV_USRTYPE1)
     {
         ADD_FAILURE() << "  Can not check regression for CV_USRTYPE1 data type for " << name;
         return *this;
-    }
+    }*/
 
     std::string nodename = getCurrentTestNodeName();
 
@@ -999,6 +1001,8 @@ void TestBase::Init(const std::vector<std::string> & availableImpls,
         "{   perf_cuda_info_only         |false    |print an information about system and an available CUDA devices and then exit.}"
 #endif
         "{ skip_unstable                 |false    |skip unstable tests }"
+
+        CV_TEST_TAGS_PARAMS
     ;
 
     cv::CommandLineParser args(argc, argv, command_line_keys);
@@ -1144,6 +1148,8 @@ void TestBase::Init(const std::vector<std::string> & availableImpls,
         perf_validation_enabled = true;
         ::testing::AddGlobalTestEnvironment(new PerfValidationEnvironment());
     }
+
+    activateTestTags(args);
 
     if (!args.check())
     {
@@ -1869,14 +1875,15 @@ void TestBase::SetUp()
     currentIter = (unsigned int)-1;
     timeLimit = timeLimitDefault;
     times.clear();
+    metrics.terminationReason = performance_metrics::TERM_SKIP_TEST;
 }
 
 void TestBase::TearDown()
 {
     if (metrics.terminationReason == performance_metrics::TERM_SKIP_TEST)
     {
-        LOGI("\tTest was skipped");
-        GTEST_SUCCEED() << "Test was skipped";
+        //LOGI("\tTest was skipped");
+        //GTEST_SUCCEED() << "Test was skipped";
     }
     else
     {
@@ -1975,6 +1982,7 @@ std::string TestBase::getDataPath(const std::string& relativePath)
 
 void TestBase::RunPerfTestBody()
 {
+    metrics.clear();
     try
     {
 #ifdef CV_COLLECT_IMPL_DATA
@@ -1987,22 +1995,22 @@ void TestBase::RunPerfTestBody()
             implConf.GetImpl();
 #endif
     }
-    catch(SkipTestException&)
+    catch(const SkipTestException&)
+    {
+        metrics.terminationReason = performance_metrics::TERM_SKIP_TEST;
+        throw;
+    }
+    catch(const PerfSkipTestException&)
     {
         metrics.terminationReason = performance_metrics::TERM_SKIP_TEST;
         return;
     }
-    catch(PerfSkipTestException&)
-    {
-        metrics.terminationReason = performance_metrics::TERM_SKIP_TEST;
-        return;
-    }
-    catch(PerfEarlyExitException&)
+    catch(const PerfEarlyExitException&)
     {
         metrics.terminationReason = performance_metrics::TERM_INTERRUPT;
         return;//no additional failure logging
     }
-    catch(cv::Exception& e)
+    catch(const cv::Exception& e)
     {
         metrics.terminationReason = performance_metrics::TERM_EXCEPTION;
         #ifdef HAVE_CUDA
@@ -2011,7 +2019,7 @@ void TestBase::RunPerfTestBody()
         #endif
         FAIL() << "Expected: PerfTestBody() doesn't throw an exception.\n  Actual: it throws cv::Exception:\n  " << e.what();
     }
-    catch(std::exception& e)
+    catch(const std::exception& e)
     {
         metrics.terminationReason = performance_metrics::TERM_EXCEPTION;
         FAIL() << "Expected: PerfTestBody() doesn't throw an exception.\n  Actual: it throws std::exception:\n  " << e.what();
@@ -2166,7 +2174,7 @@ void perf::sort(std::vector<cv::KeyPoint>& pts, cv::InputOutputArray descriptors
     for (int i = 0; i < desc.rows; ++i)
         idxs[i] = i;
 
-    std::sort((int*)idxs, (int*)idxs + desc.rows, KeypointComparator(pts));
+    std::sort(idxs.data(), idxs.data() + desc.rows, KeypointComparator(pts));
 
     std::vector<cv::KeyPoint> spts(pts.size());
     cv::Mat sdesc(desc.size(), desc.type());
@@ -2198,19 +2206,11 @@ namespace perf
 
 void PrintTo(const MatType& t, ::std::ostream* os)
 {
-    switch( CV_MAT_DEPTH((int)t) )
-    {
-        case CV_8U:  *os << "8U";  break;
-        case CV_8S:  *os << "8S";  break;
-        case CV_16U: *os << "16U"; break;
-        case CV_16S: *os << "16S"; break;
-        case CV_32S: *os << "32S"; break;
-        case CV_32F: *os << "32F"; break;
-        case CV_64F: *os << "64F"; break;
-        case CV_USRTYPE1: *os << "USRTYPE1"; break;
-        default: *os << "INVALID_TYPE"; break;
-    }
-    *os << 'C' << CV_MAT_CN((int)t);
+    String name = typeToString(t);
+    if (name.size() > 3 && name[0] == 'C' && name[1] == 'V' && name[2] == '_')
+        *os << name.substr(3);
+    else
+        *os << name;
 }
 
 } //namespace perf
