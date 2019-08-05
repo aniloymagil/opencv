@@ -5,8 +5,8 @@ import numpy as np
 
 from tests_common import NewOpenCVTests, unittest
 
-def normAssert(test, a, b, lInf=1e-5):
-    test.assertLess(np.max(np.abs(a - b)), lInf)
+def normAssert(test, a, b, msg=None, lInf=1e-5):
+    test.assertLess(np.max(np.abs(a - b)), lInf, msg)
 
 def inter_area(box1, box2):
     x_min, x_max = max(box1[0], box2[0]), min(box1[2], box2[2])
@@ -21,15 +21,11 @@ def box2str(box):
     width, height = box[2] - left, box[3] - top
     return '[%f x %f from (%f, %f)]' % (width, height, left, top)
 
-def normAssertDetections(test, ref, out, confThreshold=0.0, scores_diff=1e-5, boxes_iou_diff=1e-4):
-    ref = np.array(ref, np.float32)
-    refClassIds, testClassIds = ref[:, 1], out[:, 1]
-    refScores, testScores = ref[:, 2], out[:, 2]
-    refBoxes, testBoxes = ref[:, 3:], out[:, 3:]
-
+def normAssertDetections(test, refClassIds, refScores, refBoxes, testClassIds, testScores, testBoxes,
+                 confThreshold=0.0, scores_diff=1e-5, boxes_iou_diff=1e-4):
     matchedRefBoxes = [False] * len(refBoxes)
     errMsg = ''
-    for i in range(len(refBoxes)):
+    for i in range(len(testBoxes)):
         testScore = testScores[i]
         if testScore < confThreshold:
             continue
@@ -53,53 +49,6 @@ def normAssertDetections(test, ref, out, confThreshold=0.0, scores_diff=1e-5, bo
     if errMsg:
         test.fail(errMsg)
 
-
-# Returns a simple one-layer network created from Caffe's format
-def getSimpleNet():
-    prototxt = """
-        name: "simpleNet"
-        input: "data"
-        layer {
-          type: "Identity"
-          name: "testLayer"
-          top: "testLayer"
-          bottom: "data"
-        }
-    """
-    return cv.dnn.readNetFromCaffe(bytearray(prototxt, 'utf8'))
-
-
-def testBackendAndTarget(backend, target):
-    net = getSimpleNet()
-    net.setPreferableBackend(backend)
-    net.setPreferableTarget(target)
-    inp = np.random.standard_normal([1, 2, 3, 4]).astype(np.float32)
-    try:
-        net.setInput(inp)
-        net.forward()
-    except BaseException as e:
-        return False
-    return True
-
-
-haveInfEngine = testBackendAndTarget(cv.dnn.DNN_BACKEND_INFERENCE_ENGINE, cv.dnn.DNN_TARGET_CPU)
-dnnBackendsAndTargets = [
-    [cv.dnn.DNN_BACKEND_OPENCV, cv.dnn.DNN_TARGET_CPU],
-]
-
-if haveInfEngine:
-    dnnBackendsAndTargets.append([cv.dnn.DNN_BACKEND_INFERENCE_ENGINE, cv.dnn.DNN_TARGET_CPU])
-    if testBackendAndTarget(cv.dnn.DNN_BACKEND_INFERENCE_ENGINE, cv.dnn.DNN_TARGET_MYRIAD):
-        dnnBackendsAndTargets.append([cv.dnn.DNN_BACKEND_INFERENCE_ENGINE, cv.dnn.DNN_TARGET_MYRIAD])
-
-if cv.ocl.haveOpenCL() and cv.ocl.useOpenCL():
-    dnnBackendsAndTargets.append([cv.dnn.DNN_BACKEND_OPENCV, cv.dnn.DNN_TARGET_OPENCL])
-    dnnBackendsAndTargets.append([cv.dnn.DNN_BACKEND_OPENCV, cv.dnn.DNN_TARGET_OPENCL_FP16])
-    if haveInfEngine and cv.ocl_Device.getDefault().isIntel():
-        dnnBackendsAndTargets.append([cv.dnn.DNN_BACKEND_INFERENCE_ENGINE, cv.dnn.DNN_TARGET_OPENCL])
-        dnnBackendsAndTargets.append([cv.dnn.DNN_BACKEND_INFERENCE_ENGINE, cv.dnn.DNN_TARGET_OPENCL_FP16])
-
-
 def printParams(backend, target):
     backendNames = {
         cv.dnn.DNN_BACKEND_OPENCV: 'OCV',
@@ -116,8 +65,45 @@ def printParams(backend, target):
 
 class dnn_test(NewOpenCVTests):
 
+    def setUp(self):
+        super(dnn_test, self).setUp()
+
+        self.dnnBackendsAndTargets = [
+            [cv.dnn.DNN_BACKEND_OPENCV, cv.dnn.DNN_TARGET_CPU],
+        ]
+
+        if self.checkIETarget(cv.dnn.DNN_BACKEND_INFERENCE_ENGINE, cv.dnn.DNN_TARGET_CPU):
+            self.dnnBackendsAndTargets.append([cv.dnn.DNN_BACKEND_INFERENCE_ENGINE, cv.dnn.DNN_TARGET_CPU])
+        if self.checkIETarget(cv.dnn.DNN_BACKEND_INFERENCE_ENGINE, cv.dnn.DNN_TARGET_MYRIAD):
+            self.dnnBackendsAndTargets.append([cv.dnn.DNN_BACKEND_INFERENCE_ENGINE, cv.dnn.DNN_TARGET_MYRIAD])
+
+        if cv.ocl.haveOpenCL() and cv.ocl.useOpenCL():
+            self.dnnBackendsAndTargets.append([cv.dnn.DNN_BACKEND_OPENCV, cv.dnn.DNN_TARGET_OPENCL])
+            self.dnnBackendsAndTargets.append([cv.dnn.DNN_BACKEND_OPENCV, cv.dnn.DNN_TARGET_OPENCL_FP16])
+            if cv.ocl_Device.getDefault().isIntel():
+                if self.checkIETarget(cv.dnn.DNN_BACKEND_INFERENCE_ENGINE, cv.dnn.DNN_TARGET_OPENCL):
+                    self.dnnBackendsAndTargets.append([cv.dnn.DNN_BACKEND_INFERENCE_ENGINE, cv.dnn.DNN_TARGET_OPENCL])
+                if self.checkIETarget(cv.dnn.DNN_BACKEND_INFERENCE_ENGINE, cv.dnn.DNN_TARGET_OPENCL_FP16):
+                    self.dnnBackendsAndTargets.append([cv.dnn.DNN_BACKEND_INFERENCE_ENGINE, cv.dnn.DNN_TARGET_OPENCL_FP16])
+
     def find_dnn_file(self, filename, required=True):
-        return self.find_file(filename, [os.environ.get('OPENCV_DNN_TEST_DATA_PATH', os.getcwd())], required=required)
+        return self.find_file(filename, [os.environ.get('OPENCV_DNN_TEST_DATA_PATH', os.getcwd()),
+                                         os.environ['OPENCV_TEST_DATA_PATH']],
+                              required=required)
+
+    def checkIETarget(self, backend, target):
+        proto = self.find_dnn_file('dnn/layers/layer_convolution.prototxt', required=True)
+        model = self.find_dnn_file('dnn/layers/layer_convolution.caffemodel', required=True)
+        net = cv.dnn.readNet(proto, model)
+        net.setPreferableBackend(backend)
+        net.setPreferableTarget(target)
+        inp = np.random.standard_normal([1, 2, 10, 11]).astype(np.float32)
+        try:
+            net.setInput(inp)
+            net.forward()
+        except BaseException as e:
+            return False
+        return True
 
     def test_blobFromImage(self):
         np.random.seed(324)
@@ -146,9 +132,41 @@ class dnn_test(NewOpenCVTests):
         normAssert(self, blob, target)
 
 
+    def test_model(self):
+        img_path = self.find_dnn_file("dnn/street.png")
+        weights = self.find_dnn_file("dnn/MobileNetSSD_deploy.caffemodel")
+        config = self.find_dnn_file("dnn/MobileNetSSD_deploy.prototxt")
+        frame = cv.imread(img_path)
+        model = cv.dnn_DetectionModel(weights, config)
+        size = (300, 300)
+        mean = (127.5, 127.5, 127.5)
+        scale = 1.0 / 127.5
+        model.setInputParams(size=size, mean=mean, scale=scale)
+
+        iouDiff = 0.05
+        confThreshold = 0.0001
+        nmsThreshold = 0
+        scoreDiff = 1e-3
+
+        classIds, confidences, boxes = model.detect(frame, confThreshold, nmsThreshold)
+
+        refClassIds = (7, 15)
+        refConfidences = (0.9998, 0.8793)
+        refBoxes = ((328, 238, 85, 102), (101, 188, 34, 138))
+
+        normAssertDetections(self, refClassIds, refConfidences, refBoxes,
+                             classIds, confidences, boxes,confThreshold, scoreDiff, iouDiff)
+
+        for box in boxes:
+            cv.rectangle(frame, box, (0, 255, 0))
+            cv.rectangle(frame, np.array(box), (0, 255, 0))
+            cv.rectangle(frame, tuple(box), (0, 255, 0))
+            cv.rectangle(frame, list(box), (0, 255, 0))
+
+
     def test_face_detection(self):
         testdata_required = bool(os.environ.get('OPENCV_DNN_TEST_REQUIRE_TESTDATA', False))
-        proto = self.find_dnn_file('dnn/opencv_face_detector.prototxt2', required=testdata_required)
+        proto = self.find_dnn_file('dnn/opencv_face_detector.prototxt', required=testdata_required)
         model = self.find_dnn_file('dnn/opencv_face_detector.caffemodel', required=testdata_required)
         if proto is None or model is None:
             raise unittest.SkipTest("Missing DNN test files (dnn/opencv_face_detector.{prototxt/caffemodel}). Verify OPENCV_DNN_TEST_DATA_PATH configuration parameter.")
@@ -164,7 +182,7 @@ class dnn_test(NewOpenCVTests):
                [0, 1, 0.95097077, 0.51901293, 0.45863652, 0.5777427,  0.5347801]]
 
         print('\n')
-        for backend, target in dnnBackendsAndTargets:
+        for backend, target in self.dnnBackendsAndTargets:
             printParams(backend, target)
 
             net = cv.dnn.readNet(proto, model)
@@ -176,7 +194,60 @@ class dnn_test(NewOpenCVTests):
             scoresDiff = 4e-3 if target in [cv.dnn.DNN_TARGET_OPENCL_FP16, cv.dnn.DNN_TARGET_MYRIAD] else 1e-5
             iouDiff = 2e-2 if target in [cv.dnn.DNN_TARGET_OPENCL_FP16, cv.dnn.DNN_TARGET_MYRIAD] else 1e-4
 
-            normAssertDetections(self, ref, out, 0.5, scoresDiff, iouDiff)
+            ref = np.array(ref, np.float32)
+            refClassIds, testClassIds = ref[:, 1], out[:, 1]
+            refScores, testScores = ref[:, 2], out[:, 2]
+            refBoxes, testBoxes = ref[:, 3:], out[:, 3:]
+
+            normAssertDetections(self, refClassIds, refScores, refBoxes, testClassIds,
+                                 testScores, testBoxes, 0.5, scoresDiff, iouDiff)
+
+    def test_async(self):
+        timeout = 500*10**6  # in nanoseconds (500ms)
+        testdata_required = bool(os.environ.get('OPENCV_DNN_TEST_REQUIRE_TESTDATA', False))
+        proto = self.find_dnn_file('dnn/layers/layer_convolution.prototxt', required=testdata_required)
+        model = self.find_dnn_file('dnn/layers/layer_convolution.caffemodel', required=testdata_required)
+        if proto is None or model is None:
+            raise unittest.SkipTest("Missing DNN test files (dnn/layers/layer_convolution.{prototxt/caffemodel}). Verify OPENCV_DNN_TEST_DATA_PATH configuration parameter.")
+
+        print('\n')
+        for backend, target in self.dnnBackendsAndTargets:
+            if backend != cv.dnn.DNN_BACKEND_INFERENCE_ENGINE:
+                continue
+
+            printParams(backend, target)
+
+            netSync = cv.dnn.readNet(proto, model)
+            netSync.setPreferableBackend(backend)
+            netSync.setPreferableTarget(target)
+
+            netAsync = cv.dnn.readNet(proto, model)
+            netAsync.setPreferableBackend(backend)
+            netAsync.setPreferableTarget(target)
+
+            # Generate inputs
+            numInputs = 10
+            inputs = []
+            for _ in range(numInputs):
+                inputs.append(np.random.standard_normal([2, 6, 75, 113]).astype(np.float32))
+
+            # Run synchronously
+            refs = []
+            for i in range(numInputs):
+                netSync.setInput(inputs[i])
+                refs.append(netSync.forward())
+
+            # Run asynchronously. To make test more robust, process inputs in the reversed order.
+            outs = []
+            for i in reversed(range(numInputs)):
+                netAsync.setInput(inputs[i])
+                outs.insert(0, netAsync.forwardAsync())
+
+            for i in reversed(range(numInputs)):
+                ret, result = outs[i].get(timeoutNs=float(timeout))
+                self.assertTrue(ret)
+                normAssert(self, refs[i], result, 'Index: %d' % i, 1e-10)
+
 
 if __name__ == '__main__':
     NewOpenCVTests.bootstrap()
